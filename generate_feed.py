@@ -4,14 +4,19 @@
 archive.ph (archive.today) keeps a running list of every snapshot taken of
 https://rus.delfi.lv/ at https://archive.ph/rus.delfi.lv . The list page has
 no feed of its own, so this script scrapes the listing (title, snapshot
-permalink, snapshot date, original article URL) and turns it into RSS.
+permalink, snapshot date, original article URL), then fetches each snapshot
+page once and extracts the full article text with trafilatura. Extracted
+fulltext is cached in cache.json next to this script so re-runs don't
+re-fetch snapshots archive.ph has already rate-limited us for.
 
-Pure standard library, no third-party dependencies.
+Needs trafilatura + lxml (see venv/ — run via lauf.sh, not bare python3).
 """
 
 from __future__ import annotations
 
 import html
+import json
+import os
 import re
 import sys
 import time
@@ -20,11 +25,20 @@ import urllib.request
 from datetime import datetime, timezone
 from email.utils import format_datetime
 
+import trafilatura
+
 SOURCE = "https://archive.ph/rus.delfi.lv"
 FEED_URL = "https://denkacs-star.github.io/delfi-archive-rss/feed.xml"
 SITE_URL = "https://denkacs-star.github.io/delfi-archive-rss/"
 
 MAX_ITEMS = 60
+EXCERPT_LEN = 400
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_FILE = os.path.join(SCRIPT_DIR, "cache.json")
+
+# Pause between per-snapshot fetches so we don't hammer archive.ph.
+SNAPSHOT_FETCH_DELAY = 4
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -62,6 +76,8 @@ def fetch(url: str) -> str:
             last_exc = exc
             if exc.code != 429:
                 raise
+        except urllib.error.URLError as exc:
+            last_exc = exc
     raise last_exc
 
 
@@ -104,6 +120,55 @@ def parse_entries(page: str):
         }
 
 
+def load_cache() -> dict:
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    return {}
+
+
+def save_cache(cache: dict) -> None:
+    with open(CACHE_FILE, "w", encoding="utf-8") as fh:
+        json.dump(cache, fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def excerpt_from_html(body_html: str, length: int = EXCERPT_LEN) -> str:
+    text = re.sub(r"<[^>]+>", " ", body_html)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= length:
+        return text
+    return text[:length].rsplit(" ", 1)[0] + "…"
+
+
+def fetch_fulltext(archive_link: str) -> dict | None:
+    """Fetch a single archive.ph snapshot and extract the article body.
+
+    Raises on network/HTTP failure so the caller can tell "transient error,
+    retry tomorrow" apart from "fetched fine, just nothing to extract".
+    """
+    page = fetch(archive_link)
+
+    body_html = trafilatura.extract(
+        page,
+        include_comments=False,
+        include_tables=False,
+        output_format="html",
+    )
+    if not body_html:
+        return None
+
+    # Drop the leading <h1> — the RSS <title> already carries it.
+    body_html = re.sub(r"^\s*<html>\s*<body>\s*<h1>.*?</h1>", "", body_html, count=1, flags=re.S)
+    body_html = re.sub(r"</body>\s*</html>\s*$", "", body_html).strip()
+
+    meta = trafilatura.extract_metadata(page)
+    return {
+        "body_html": body_html,
+        "excerpt": excerpt_from_html(body_html),
+        "author": meta.author if meta and meta.author else None,
+    }
+
+
 def collect():
     page = fetch(SOURCE)
     items = list(parse_entries(page))
@@ -115,20 +180,47 @@ def collect():
             continue
         seen.add(it["archive_link"])
         result.append(it)
-    return result[:MAX_ITEMS]
+    result = result[:MAX_ITEMS]
+
+    cache = load_cache()
+    dirty = False
+    for it in result:
+        have_cached = it["archive_link"] in cache
+        cached = cache.get(it["archive_link"])
+        if not have_cached:
+            print(f"fetching fulltext: {it['title'][:60]}", file=sys.stderr)
+            try:
+                fulltext = fetch_fulltext(it["archive_link"])
+            except Exception as exc:  # noqa: BLE001 - transient, retry tomorrow
+                print(f"warn: fetching {it['archive_link']} failed: {exc}", file=sys.stderr)
+            else:
+                # Cache the outcome, including "nothing extractable" (stable
+                # result) — but only after a successful fetch.
+                cache[it["archive_link"]] = fulltext
+                dirty = True
+                cached = fulltext
+            time.sleep(SNAPSHOT_FETCH_DELAY)
+        if cached:
+            it.update(cached)
+
+    if dirty:
+        save_cache(cache)
+
+    return result
 
 
 def build_rss(items) -> str:
     now = format_datetime(datetime.now(tz=timezone.utc))
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">',
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" '
+        'xmlns:content="http://purl.org/rss/1.0/modules/content/">',
         "  <channel>",
         "    <title>rus.delfi.lv – archive.ph Snapshots</title>",
         f"    <link>{SOURCE}</link>",
         "    <description>Inoffizieller Feed der archive.ph-Archivkopien von "
         "rus.delfi.lv – jeder Eintrag ist ein neuer Snapshot der Original-"
-        "Website.</description>",
+        "Website, inklusive Volltext.</description>",
         "    <language>ru</language>",
         f"    <lastBuildDate>{now}</lastBuildDate>",
         "    <generator>delfi-archive-rss (github.com/denkacs-star/delfi-archive-rss)</generator>",
@@ -138,14 +230,29 @@ def build_rss(items) -> str:
         title = html.escape(a["title"])
         link = html.escape(a["archive_link"])
         orig = html.escape(a["original_url"])
-        desc = html.escape(f"Archiv-Snapshot von {a['original_url']}")
+        body_html = a.get("body_html")
+        if body_html:
+            desc = html.escape(a["excerpt"])
+        else:
+            desc = html.escape(f"Archiv-Snapshot von {a['original_url']}")
+
         parts.append("    <item>")
         parts.append(f"      <title>{title}</title>")
         parts.append(f"      <link>{link}</link>")
         parts.append(f'      <guid isPermaLink="true">{link}</guid>')
         parts.append(f"      <pubDate>{format_datetime(a['date'])}</pubDate>")
+        if a.get("author"):
+            parts.append(f"      <author>{html.escape(a['author'])}</author>")
         parts.append(f"      <description>{desc}</description>")
         parts.append(f"      <comments>{orig}</comments>")
+        if body_html:
+            footer = (
+                f'<p><em>Original: <a href="{orig}">{orig}</a> · '
+                f'Archiv-Snapshot: <a href="{link}">{link}</a></em></p>'
+            )
+            parts.append(
+                f"      <content:encoded><![CDATA[{body_html}{footer}]]></content:encoded>"
+            )
         parts.append("    </item>")
     parts.append("  </channel>")
     parts.append("</rss>")
@@ -171,8 +278,9 @@ INDEX_HTML = """<!doctype html>
 <body>
 <h1>rus.delfi.lv – Archiv-RSS</h1>
 <p>Inoffizieller RSS-Feed der <a href="{source}">archive.ph-Snapshot-Liste</a>
-von <a href="https://rus.delfi.lv/">rus.delfi.lv</a>. Jeder neue Snapshot wird
-als Eintrag im Feed geführt. Wird täglich automatisch aktualisiert.</p>
+von <a href="https://rus.delfi.lv/">rus.delfi.lv</a>, inklusive Artikel-Volltext.
+Jeder neue Snapshot wird als Eintrag im Feed geführt. Wird täglich automatisch
+aktualisiert.</p>
 <p><strong>Feed-Adresse (in den RSS-Reader kopieren):</strong><br>
 <code>{feed_url}</code></p>
 <p><a href="feed.xml">→ feed.xml öffnen</a></p>
@@ -207,8 +315,6 @@ def build_index(items) -> str:
 
 
 def main():
-    import os
-
     outdir = sys.argv[1] if len(sys.argv) > 1 else "docs"
     os.makedirs(outdir, exist_ok=True)
     items = collect()
@@ -219,7 +325,8 @@ def main():
         fh.write(build_rss(items))
     with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as fh:
         fh.write(build_index(items))
-    print(f"wrote {len(items)} items to {outdir}/feed.xml")
+    n_full = sum(1 for a in items if a.get("body_html"))
+    print(f"wrote {len(items)} items ({n_full} with fulltext) to {outdir}/feed.xml")
 
 
 if __name__ == "__main__":

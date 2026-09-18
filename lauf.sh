@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-/usr/bin/env python3 generate_feed.py docs
+./venv/bin/python generate_feed.py docs
 
 git add docs
 if ! git diff --cached --quiet -- docs; then
