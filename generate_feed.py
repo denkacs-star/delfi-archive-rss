@@ -14,6 +14,8 @@ from __future__ import annotations
 import html
 import re
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -28,6 +30,14 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru,en;q=0.8,de;q=0.6",
+}
+
+# archive.ph rate-limits aggressively (HTTP 429); retry with backoff.
+RETRY_DELAYS = [15, 60, 180]
 
 MONTHS = {
     m: i + 1
@@ -38,10 +48,21 @@ MONTHS = {
 
 
 def fetch(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read()
-    return raw.decode("utf-8", "replace")
+    req = urllib.request.Request(url, headers=HEADERS)
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate([0] + RETRY_DELAYS):
+        if delay:
+            print(f"retry {attempt} after {delay}s (last error: {last_exc})", file=sys.stderr)
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+            return raw.decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code != 429:
+                raise
+    raise last_exc
 
 
 def clean(text: str) -> str:
