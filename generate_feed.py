@@ -209,7 +209,7 @@ def build_index(items) -> str:
 def main():
     import os
 
-    outdir = sys.argv[1] if len(sys.argv) > 1 else "public"
+    outdir = sys.argv[1] if len(sys.argv) > 1 else "docs"
     os.makedirs(outdir, exist_ok=True)
     items = collect()
     if not items:
