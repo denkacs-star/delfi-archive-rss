@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Generate an RSS 2.0 feed from the archive.ph snapshot list for rus.delfi.lv.
+
+archive.ph (archive.today) keeps a running list of every snapshot taken of
+https://rus.delfi.lv/ at https://archive.ph/rus.delfi.lv . The list page has
+no feed of its own, so this script scrapes the listing (title, snapshot
+permalink, snapshot date, original article URL) and turns it into RSS.
+
+Pure standard library, no third-party dependencies.
+"""
+
+from __future__ import annotations
+
+import html
+import re
+import sys
+import urllib.request
+from datetime import datetime, timezone
+from email.utils import format_datetime
+
+SOURCE = "https://archive.ph/rus.delfi.lv"
+FEED_URL = "https://denkacs-star.github.io/delfi-archive-rss/feed.xml"
+SITE_URL = "https://denkacs-star.github.io/delfi-archive-rss/"
+
+MAX_ITEMS = 60
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+MONTHS = {
+    m: i + 1
+    for i, m in enumerate(
+        "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+    )
+}
+
+
+def fetch(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+    return raw.decode("utf-8", "replace")
+
+
+def clean(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return html.unescape(text).strip()
+
+
+def parse_date(text: str) -> datetime:
+    # e.g. "17 Sep 2026 10:50"
+    day, mon, year, time_ = text.split()
+    hour, minute = time_.split(":")
+    return datetime(
+        int(year), MONTHS[mon], int(day), int(hour), int(minute), tzinfo=timezone.utc
+    )
+
+
+def parse_entries(page: str):
+    """Yield entry dicts from an archive.ph listing page."""
+    rows = re.split(r'<div id="row\d+"', page)[1:]
+    for row in rows:
+        date_m = re.search(
+            r'text-align:right">(\d{1,2} \w{3} \d{4} \d{2}:\d{2})</div>', row
+        )
+        title_link_m = re.search(
+            r'font-size:16px;word-break:break-word" href="(https://archive\.ph/[^"]+)">(.*?)</a>',
+            row,
+            re.S,
+        )
+        orig_m = re.search(r'href="https://archive\.ph/(https?://[^"]+)"', row)
+        if not (date_m and title_link_m and orig_m):
+            continue
+
+        yield {
+            "date": parse_date(date_m.group(1)),
+            "archive_link": title_link_m.group(1),
+            "title": clean(title_link_m.group(2)),
+            "original_url": html.unescape(orig_m.group(1)),
+        }
+
+
+def collect():
+    page = fetch(SOURCE)
+    items = list(parse_entries(page))
+    # newest first, de-dup by archive_link just in case
+    seen = set()
+    result = []
+    for it in sorted(items, key=lambda a: a["date"], reverse=True):
+        if it["archive_link"] in seen:
+            continue
+        seen.add(it["archive_link"])
+        result.append(it)
+    return result[:MAX_ITEMS]
+
+
+def build_rss(items) -> str:
+    now = format_datetime(datetime.now(tz=timezone.utc))
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">',
+        "  <channel>",
+        "    <title>rus.delfi.lv – archive.ph Snapshots</title>",
+        f"    <link>{SOURCE}</link>",
+        "    <description>Inoffizieller Feed der archive.ph-Archivkopien von "
+        "rus.delfi.lv – jeder Eintrag ist ein neuer Snapshot der Original-"
+        "Website.</description>",
+        "    <language>ru</language>",
+        f"    <lastBuildDate>{now}</lastBuildDate>",
+        "    <generator>delfi-archive-rss (github.com/denkacs-star/delfi-archive-rss)</generator>",
+        f'    <atom:link href="{FEED_URL}" rel="self" type="application/rss+xml"/>',
+    ]
+    for a in items:
+        title = html.escape(a["title"])
+        link = html.escape(a["archive_link"])
+        orig = html.escape(a["original_url"])
+        desc = html.escape(f"Archiv-Snapshot von {a['original_url']}")
+        parts.append("    <item>")
+        parts.append(f"      <title>{title}</title>")
+        parts.append(f"      <link>{link}</link>")
+        parts.append(f'      <guid isPermaLink="true">{link}</guid>')
+        parts.append(f"      <pubDate>{format_datetime(a['date'])}</pubDate>")
+        parts.append(f"      <description>{desc}</description>")
+        parts.append(f"      <comments>{orig}</comments>")
+        parts.append("    </item>")
+    parts.append("  </channel>")
+    parts.append("</rss>")
+    return "\n".join(parts) + "\n"
+
+
+INDEX_HTML = """<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rus.delfi.lv Archiv-RSS</title>
+<link rel="alternate" type="application/rss+xml" title="rus.delfi.lv archive.ph Snapshots" href="feed.xml">
+<style>
+  body {{ font-family: system-ui, sans-serif; max-width: 42rem; margin: 3rem auto;
+         padding: 0 1rem; line-height: 1.5; color: #1a1a1a; }}
+  a {{ color: #0645ad; }}
+  code {{ background: #f2f2f2; padding: .1rem .35rem; border-radius: 4px; }}
+  .muted {{ color: #666; font-size: .9rem; }}
+  ul {{ padding-left: 1.2rem; }}
+</style>
+</head>
+<body>
+<h1>rus.delfi.lv – Archiv-RSS</h1>
+<p>Inoffizieller RSS-Feed der <a href="{source}">archive.ph-Snapshot-Liste</a>
+von <a href="https://rus.delfi.lv/">rus.delfi.lv</a>. Jeder neue Snapshot wird
+als Eintrag im Feed geführt. Wird täglich automatisch aktualisiert.</p>
+<p><strong>Feed-Adresse (in den RSS-Reader kopieren):</strong><br>
+<code>{feed_url}</code></p>
+<p><a href="feed.xml">→ feed.xml öffnen</a></p>
+<h2>Aktuell im Feed ({count} Snapshots)</h2>
+<ul>
+{items}
+</ul>
+<p class="muted">Zuletzt gebaut: {built} · Quelle: archive.ph ·
+<a href="https://github.com/denkacs-star/delfi-archive-rss">Quellcode &amp; Automatik auf GitHub</a></p>
+</body>
+</html>
+"""
+
+
+def build_index(items) -> str:
+    lis = "\n".join(
+        '<li><a href="{link}">{title}</a> '
+        '<span class="muted">– {date}</span></li>'.format(
+            link=html.escape(a["archive_link"]),
+            title=html.escape(a["title"]),
+            date=a["date"].strftime("%d.%m.%Y %H:%M"),
+        )
+        for a in items
+    )
+    return INDEX_HTML.format(
+        source=SOURCE,
+        feed_url=FEED_URL,
+        count=len(items),
+        items=lis,
+        built=datetime.now(tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC"),
+    )
+
+
+def main():
+    import os
+
+    outdir = sys.argv[1] if len(sys.argv) > 1 else "public"
+    os.makedirs(outdir, exist_ok=True)
+    items = collect()
+    if not items:
+        print("error: no entries parsed – aborting", file=sys.stderr)
+        sys.exit(1)
+    with open(os.path.join(outdir, "feed.xml"), "w", encoding="utf-8") as fh:
+        fh.write(build_rss(items))
+    with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as fh:
+        fh.write(build_index(items))
+    print(f"wrote {len(items)} items to {outdir}/feed.xml")
+
+
+if __name__ == "__main__":
+    main()
