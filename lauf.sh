@@ -7,8 +7,8 @@ cd "$(dirname "$0")"
 
 ./venv/bin/python generate_feed.py docs
 
-git add docs
-if ! git diff --cached --quiet -- docs; then
+git add docs cache.json
+if ! git diff --cached --quiet -- docs cache.json; then
     git commit -m "Feed-Update $(date -u +%Y-%m-%dT%H:%MZ)"
     git push origin main
     echo "gepusht"

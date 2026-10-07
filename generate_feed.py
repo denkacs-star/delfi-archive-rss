@@ -61,10 +61,13 @@ MONTHS = {
 }
 
 
-def fetch(url: str) -> str:
+def fetch(url: str, delays: list[int] | None = None) -> str:
+    """GET url. `delays` = backoff schedule for HTTP 429 (default RETRY_DELAYS)."""
+    if delays is None:
+        delays = RETRY_DELAYS
     req = urllib.request.Request(url, headers=HEADERS)
     last_exc: Exception | None = None
-    for attempt, delay in enumerate([0] + RETRY_DELAYS):
+    for attempt, delay in enumerate([0] + delays):
         if delay:
             print(f"retry {attempt} after {delay}s (last error: {last_exc})", file=sys.stderr)
             time.sleep(delay)
@@ -140,14 +143,7 @@ def excerpt_from_html(body_html: str, length: int = EXCERPT_LEN) -> str:
     return text[:length].rsplit(" ", 1)[0] + "…"
 
 
-def fetch_fulltext(archive_link: str) -> dict | None:
-    """Fetch a single archive.ph snapshot and extract the article body.
-
-    Raises on network/HTTP failure so the caller can tell "transient error,
-    retry tomorrow" apart from "fetched fine, just nothing to extract".
-    """
-    page = fetch(archive_link)
-
+def extract_article(page: str) -> dict | None:
     body_html = trafilatura.extract(
         page,
         include_comments=False,
@@ -158,8 +154,9 @@ def fetch_fulltext(archive_link: str) -> dict | None:
         return None
 
     # Drop the leading <h1> — the RSS <title> already carries it.
-    body_html = re.sub(r"^\s*<html>\s*<body>\s*<h1>.*?</h1>", "", body_html, count=1, flags=re.S)
-    body_html = re.sub(r"</body>\s*</html>\s*$", "", body_html).strip()
+    body_html = re.sub(r"^\s*<html>\s*<body>\s*", "", body_html)
+    body_html = re.sub(r"^\s*<h1>.*?</h1>\s*", "", body_html, count=1, flags=re.S)
+    body_html = re.sub(r"\s*</body>\s*</html>\s*$", "", body_html).strip()
 
     meta = trafilatura.extract_metadata(page)
     return {
@@ -167,6 +164,26 @@ def fetch_fulltext(archive_link: str) -> dict | None:
         "excerpt": excerpt_from_html(body_html),
         "author": meta.author if meta and meta.author else None,
     }
+
+
+def fetch_fulltext(archive_link: str) -> dict | None:
+    """Fetch one archive.ph snapshot (single attempt) and extract the article.
+
+    Raises on network/HTTP failure so the caller can tell "transient error,
+    retry tomorrow" apart from "fetched fine, just nothing to extract".
+    """
+    result = extract_article(fetch(archive_link, delays=[]))
+    if result:
+        result["source"] = "archive"
+    return result
+
+
+def fetch_original(original_url: str) -> dict | None:
+    """Fallback: article start from the live page (paywalled -> teaser only)."""
+    result = extract_article(fetch(original_url, delays=[]))
+    if result:
+        result["source"] = "original"
+    return result
 
 
 def collect():
@@ -184,22 +201,55 @@ def collect():
 
     cache = load_cache()
     dirty = False
+    # Set on the first HTTP 429 (archive.ph CAPTCHA wall): stop asking for
+    # snapshots for the rest of this run instead of burning minutes on retries.
+    archive_blocked = False
     for it in result:
-        have_cached = it["archive_link"] in cache
-        cached = cache.get(it["archive_link"])
-        if not have_cached:
+        link = it["archive_link"]
+        have_cached = link in cache
+        cached = cache.get(link)
+        # Wanted from the archive: never fetched, or only the paywalled
+        # teaser from the original so far (upgrade once archive.ph answers).
+        wants_archive = not have_cached or (
+            cached is not None and cached.get("source") == "original"
+        )
+
+        if wants_archive and not archive_blocked:
             print(f"fetching fulltext: {it['title'][:60]}", file=sys.stderr)
             try:
-                fulltext = fetch_fulltext(it["archive_link"])
+                fulltext = fetch_fulltext(link)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    archive_blocked = True
+                    print("warn: archive.ph answers 429 (CAPTCHA) – skipping "
+                          "further snapshots this run", file=sys.stderr)
+                else:
+                    print(f"warn: fetching {link} failed: {exc}", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001 - transient, retry tomorrow
-                print(f"warn: fetching {it['archive_link']} failed: {exc}", file=sys.stderr)
+                print(f"warn: fetching {link} failed: {exc}", file=sys.stderr)
             else:
-                # Cache the outcome, including "nothing extractable" (stable
-                # result) — but only after a successful fetch.
-                cache[it["archive_link"]] = fulltext
-                dirty = True
-                cached = fulltext
+                # Cache "nothing extractable" too (stable) — but never let it
+                # overwrite a teaser we already have.
+                if fulltext is not None or not have_cached:
+                    cache[link] = fulltext
+                    dirty = True
+                    cached = fulltext
             time.sleep(SNAPSHOT_FETCH_DELAY)
+
+        if not cached and not have_cached and link not in cache:
+            # No archive text (blocked/failed): take the start of the article
+            # from the live page so the feed item isn't empty.
+            try:
+                fallback = fetch_original(it["original_url"])
+            except Exception as exc:  # noqa: BLE001
+                print(f"warn: original {it['original_url']} failed: {exc}", file=sys.stderr)
+            else:
+                if fallback:
+                    cache[link] = fallback
+                    dirty = True
+                    cached = fallback
+            time.sleep(1)
+
         if cached:
             it.update(cached)
 
@@ -246,12 +296,19 @@ def build_rss(items) -> str:
         parts.append(f"      <description>{desc}</description>")
         parts.append(f"      <comments>{orig}</comments>")
         if body_html:
+            notice = ""
+            if a.get("source") == "original":
+                notice = (
+                    "<p><strong>Nur der Artikelanfang (Paywall).</strong> "
+                    "Der Volltext wird nachgeladen, sobald archive.ph den "
+                    "Snapshot wieder ausliefert.</p>"
+                )
             footer = (
                 f'<p><em>Original: <a href="{orig}">{orig}</a> · '
                 f'Archiv-Snapshot: <a href="{link}">{link}</a></em></p>'
             )
             parts.append(
-                f"      <content:encoded><![CDATA[{body_html}{footer}]]></content:encoded>"
+                f"      <content:encoded><![CDATA[{notice}{body_html}{footer}]]></content:encoded>"
             )
         parts.append("    </item>")
     parts.append("  </channel>")
