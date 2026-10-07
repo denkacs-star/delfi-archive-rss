@@ -179,10 +179,16 @@ def fetch_fulltext(archive_link: str) -> dict | None:
 
 
 def fetch_original(original_url: str) -> dict | None:
-    """Fallback: article start from the live page (paywalled -> teaser only)."""
-    result = extract_article(fetch(original_url, delays=[]))
+    """Fallback: article from the live page.
+
+    Paywalled articles only yield the teaser ("original", upgraded from the
+    archive later); free ones are complete ("original_free", final).
+    """
+    page = fetch(original_url, delays=[])
+    result = extract_article(page)
     if result:
-        result["source"] = "original"
+        free = re.search(r'"isAccessibleForFree"\s*:\s*"?true', page)
+        result["source"] = "original_free" if free else "original"
     return result
 
 
@@ -253,6 +259,12 @@ def collect():
         if cached:
             it.update(cached)
 
+    # Items that left the listing never come back into the feed.
+    current = {it["archive_link"] for it in result}
+    for stale in [k for k in cache if k not in current]:
+        del cache[stale]
+        dirty = True
+
     if dirty:
         save_cache(cache)
 
@@ -264,7 +276,8 @@ def build_rss(items) -> str:
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" '
-        'xmlns:content="http://purl.org/rss/1.0/modules/content/">',
+        'xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+        'xmlns:dc="http://purl.org/dc/elements/1.1/">',
         "  <channel>",
         "    <title>rus.delfi.lv – archive.ph Snapshots</title>",
         f"    <link>{SOURCE}</link>",
@@ -292,7 +305,7 @@ def build_rss(items) -> str:
         parts.append(f'      <guid isPermaLink="true">{link}</guid>')
         parts.append(f"      <pubDate>{format_datetime(a['date'])}</pubDate>")
         if a.get("author"):
-            parts.append(f"      <author>{html.escape(a['author'])}</author>")
+            parts.append(f"      <dc:creator>{html.escape(a['author'])}</dc:creator>")
         parts.append(f"      <description>{desc}</description>")
         parts.append(f"      <comments>{orig}</comments>")
         if body_html:

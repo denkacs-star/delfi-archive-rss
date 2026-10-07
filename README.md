@@ -53,6 +53,17 @@ erkannt), Link zum Snapshot (`archive.ph/…`), Datum, ein Teaser als
 Lässt sich ein Snapshot nicht extrahieren (z. B. reine Foto-Galerien ohne
 Fließtext), fällt der Eintrag auf einen kurzen Hinweistext zurück.
 
+### Wenn archive.ph sperrt
+
+Antwortet archive.ph auf Snapshot-Seiten mit HTTP 429 (CAPTCHA-Seite), macht
+das Skript im laufenden Durchgang keine weiteren Archiv-Abrufe und holt den
+Artikel stattdessen direkt von rus.delfi.lv:
+
+- Paywall-Artikel (`isAccessibleForFree: false`): nur der Anfang, im Feed mit
+  Hinweis markiert; wird automatisch durch den Archiv-Volltext ersetzt,
+  sobald archive.ph wieder antwortet (ein Versuch pro Lauf).
+- Freie Artikel: vollständig, gilt als endgültig.
+
 ## Lokal ausführen
 
 ```bash
@@ -65,7 +76,8 @@ cd ~/scripts/delfi-archive-rss
 
 Oben in `generate_feed.py`:
 
-- `MAX_ITEMS` — Anzahl der Einträge im Feed (Standard 60)
+- `MAX_ITEMS` — Obergrenze der Einträge (Standard 60; faktisch 20, so viele
+  zeigt die erste archive.ph-Listenseite)
 - `EXCERPT_LEN` — Länge des Teasers in `<description>` (Standard 400 Zeichen)
 - `SNAPSHOT_FETCH_DELAY` — Pause zwischen Snapshot-Abrufen (Standard 4s)
 
