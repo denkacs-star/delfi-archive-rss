@@ -178,6 +178,18 @@ def fetch_fulltext(archive_link: str) -> dict | None:
     return result
 
 
+# Delfi's subscription-offer placeholder that sits where the paywall cuts the
+# article ("Please wait! We're picking the best subscription offer…").
+PAYWALL_PLACEHOLDER = re.compile(
+    r"<p>\s*(?:Пожалуйста, подождите|Мы подбираем для вас|Предложение о подписке)"
+)
+
+
+def strip_paywall_placeholder(body_html: str) -> str:
+    m = PAYWALL_PLACEHOLDER.search(body_html)
+    return body_html[: m.start()].rstrip() if m else body_html
+
+
 def fetch_original(original_url: str) -> dict | None:
     """Fallback: article from the live page.
 
@@ -187,6 +199,8 @@ def fetch_original(original_url: str) -> dict | None:
     page = fetch(original_url, delays=[])
     result = extract_article(page)
     if result:
+        result["body_html"] = strip_paywall_placeholder(result["body_html"])
+        result["excerpt"] = excerpt_from_html(result["body_html"])
         free = re.search(r'"isAccessibleForFree"\s*:\s*"?true', page)
         result["source"] = "original_free" if free else "original"
     return result
